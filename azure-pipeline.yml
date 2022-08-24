@@ -1,0 +1,143 @@
+trigger:
+  branches:
+    include:
+      - master
+    exclude:
+      - azure-pipeline.yml
+
+pool: 
+  name: 'Default'
+  demands:
+  - agent.os -equals Linux
+
+resources:
+- repo: self
+
+variables:
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: '905fc28f-8f4e-4f00-bcad-78b7445665d1'
+  imageRepository: 'sql-connection/sql-connection'
+  containerRegistry: 'sgsin01acr01.azurecr.io'
+  dockerfilePath: '**/Dockerfile'
+  tag: 'latest'
+  
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+stages:
+- stage: Build
+  displayName: Build and push stage
+  jobs:
+  - job: Build
+    displayName: Build
+    steps:
+   
+    - task: CmdLine@2
+      inputs:
+        script: |
+          echo > Dockerfile
+          
+          cat > Dockerfile <<EOF
+          FROM python:3
+          EXPOSE 1433
+          WORKDIR /app
+          ADD requirements.txt .
+          ADD app.py .
+          
+          RUN su \
+            && curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
+            && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list \
+            && exit
+          RUN apt-get update -y
+          RUN export DEBIAN_FRONTEND="noninteractive"
+          RUN apt -y install dialog
+          RUN ACCEPT_EULA=Y apt-get install -y msodbcsql18
+          RUN ACCEPT_EULA=Y apt-get install -y mssql-tools18
+          RUN echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
+          RUN . ~/.bashrc
+          RUN apt-get install -y unixodbc-dev
+          RUN apt-get install -y libgssapi-krb5-2
+
+          RUN pip install -r requirements.txt
+          
+          CMD ["python","-i","app.py"]
+         
+          EOF
+    
+
+    - task: CmdLine@2
+      inputs:
+        script: |
+          mkdir manifests    
+          
+          echo > cronjob.yml
+          
+          cat > cronjob.yml <<EOF
+          # apiVersion: batch/v1beta1
+          # #apiVersion: batch/v1
+          # kind: CronJob
+          # metadata:
+          #   name: sql-connection
+          # spec:
+          #   schedule: "*/1 * * * *" 
+          #   jobTemplate:
+          #     spec:
+          #       template:
+          #         spec:
+          #           containers:
+          #           - name: sql-connection
+          #             image:  sgsin01acr01.azurecr.io/sql-connection/sql-connection:latest
+          #             imagePullPolicy: Always
+          #           restartPolicy: OnFailure
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: sql-connection
+          spec: 
+            template:
+              metadata:
+                name: sql-connection
+              spec:
+                  containers:
+                  - name: sql-connection
+                    image:  sgsin01acr01.azurecr.io/sql-connection/sql-connection:latest
+                    imagePullPolicy: Always
+                  restartPolicy: OnFailure
+          EOF
+          echo > service.yml
+          
+          cat > service.yml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: sql-connection
+          spec:
+            type: ClusterIP
+            ports:
+              - port: 1433
+            selector:
+              app: sql-connection
+          EOF
+
+          
+
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Pipeline.Workspace)'
+        artifact: 'sqlConnection'
+        publishLocation: 'pipeline'
+        
+    - task: CmdLine@2
+      inputs:
+        script: 'docker rmi -f $(docker images -a -q)'
